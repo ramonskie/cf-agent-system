@@ -815,74 +815,177 @@ opencode satisfies all of these out of the box:
 
 ## 9. Sub-Agent Spawning Protocol
 
-### 9.1 Two Levels of Sub-Agents
+### 9.1 Phase Availability
 
-**Level 1 — opencode Sessions (internal to one container)**
+| Level | Mechanism | Available in |
+|-------|-----------|-------------|
+| **Level 1** | opencode `task` tool — child sessions inside one container | **Phase 1** — zero CF changes |
+| **Level 2** | CF sub-agents — separate Diego containers per sub-agent | **Phase 2** — requires CAPI `parent_agent` support |
 
-A running opencode server can create child sessions via `parentID`. These are
-opencode-internal sub-agents — they share the same process, same CF credentials,
-same container.
+### 9.2 Level 1 — opencode Task Tool (Phase 1)
 
-```
-opencode server (container A)
-+-- session: abc123            (root -- "build a REST API")
-    +-- session: def456        (child -- "write the handler")
-    +-- session: ghi789        (child -- "write the tests")
-```
+opencode has a built-in `task` tool (source: `packages/opencode/src/tool/task.ts`).
+When the LLM calls this tool, opencode **automatically**:
 
-This is opencode's native sub-agent mechanism and requires **zero CF changes**.
+1. Creates a child session (`sessions.create({ parentID: ctx.sessionID, ... })`)
+2. Runs a new prompt in that child session using a named sub-agent type
+3. Returns the result to the parent session
 
-Detection: `GET /session/<rootID>/children` returns direct child sessions.
-`GET /session?roots=true` returns only root sessions.
+The sub-agent type (`subagent_type`) refers to a named agent defined in `opencode.json`.
+Sub-agents with `mode: "subagent"` are only available to the task tool (not shown in the
+UI agent picker). Sub-agents with `mode: "primary"` are excluded from task tool dispatch.
 
-**Level 2 — CF Agent Sub-Agents (separate containers)**
-
-For heavier isolation, an agent requests the CF platform spawn a new agent
-in a separate container, by calling the CF API:
+**opencode.json configuration** (baked into the container image or mounted via CF env):
 
 ```json
-POST $CF_API_URL/v3/agents
 {
-  "name": "sub-agent-go-spec",
-  "type": "opencode",
-  "relationships": {
-    "space":        { "data": { "guid": "$AGENT_SPACE_GUID" } },
-    "parent_agent": { "data": { "guid": "$AGENT_GUID" } }
+  "agents": {
+    "go-specialist": {
+      "mode": "subagent",
+      "description": "Writes idiomatic Go code, tests, and interfaces",
+      "prompt": "You are a Go specialist. Write idiomatic, well-tested Go code.",
+      "model": "anthropic/claude-sonnet-4-5"
+    },
+    "test-writer": {
+      "mode": "subagent",
+      "description": "Writes unit and integration tests for existing code",
+      "prompt": "You are a test specialist. Write thorough, focused tests.",
+      "model": "anthropic/claude-sonnet-4-5"
+    },
+    "cf-operator": {
+      "mode": "subagent",
+      "description": "Manages CF apps via V3 REST API calls",
+      "prompt": "You manage CF apps. Use shell tool to call the CF V3 API with the injected credentials.",
+      "model": "anthropic/claude-sonnet-4-5"
+    }
   }
 }
 ```
 
-The new container gets its own route, its own opencode server instance, its own sessions.
+**Task tool parameters** (what the LLM sends when calling the tool):
 
-### 9.2 When to Use Each Level
+```json
+{
+  "description": "Write the HTTP handler",
+  "prompt": "Write a Go HTTP handler for POST /health that returns 200 OK",
+  "subagent_type": "go-specialist",
+  "task_id": "<optional: resume a previous child session>"
+}
+```
 
-| Use Level 1 (opencode sessions) | Use Level 2 (CF sub-agents) |
-|---------------------------------|-----------------------------|
+**Session tree inside the container:**
+
+```
+opencode server (container A)
++-- session: abc123  (root — "build a REST API for CF health checks")
+    +-- session: def456  (@go-specialist — "write the HTTP handler")
+    +-- session: ghi789  (@test-writer   — "write the tests")
+    +-- session: jkl012  (@cf-operator   — "push the app to CF")
+```
+
+Detection via HTTP API:
+```
+GET /session?roots=true              → lists only root sessions
+GET /session/abc123/children         → lists def456, ghi789, jkl012
+GET /session/status                  → {"abc123": "busy", "def456": "idle", ...}
+```
+
+**Permission scoping** — the task tool enforces permissions at spawn time:
+- A sub-agent definition can restrict which tools it can use (`permission` field)
+- The task tool can deny `task` permission on child sessions (preventing grandchild spawning)
+- This is enforced in `TaskTool` source before `sessions.create()` is called
+
+**Resuming** — `task_id` in the tool call continues an existing child session rather
+than creating a new one. The LLM uses this to pick up a partially completed sub-task.
+
+### 9.3 Level 2 — CF Sub-Agents (Phase 2)
+
+For workloads that need their own container — isolated disk, separate codebase,
+independent lifecycle — the agent calls the CF V3 API to spawn a new agent:
+
+**Step 1: spawn**
+```bash
+RESPONSE=$(curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  "$CF_API_URL/v3/agents" \
+  -d '{
+    "name": "sub-agent-go-spec",
+    "type": "opencode",
+    "relationships": {
+      "space":        { "data": { "guid": "'$AGENT_SPACE_GUID'" } },
+      "parent_agent": { "data": { "guid": "'$AGENT_GUID'" } }
+    }
+  }')
+
+JOB_URL=$(echo $RESPONSE | jq -r '.links.job.href')
+```
+
+**Step 2: poll job to completion**
+```bash
+# Poll until state == "complete"
+while true; do
+  STATE=$(curl -s -H "Authorization: Bearer $TOKEN" "$CF_API_URL$JOB_URL" | jq -r '.state')
+  [ "$STATE" = "COMPLETE" ] && break
+  sleep 2
+done
+```
+
+**Step 3: get the sub-agent's route**
+```bash
+SUB_AGENT_GUID=$(curl -s -H "Authorization: Bearer $TOKEN" "$CF_API_URL$JOB_URL" \
+  | jq -r '.links.resource.href' | xargs -I{} curl -s -H "Authorization: Bearer $TOKEN" "$CF_API_URL{}" \
+  | jq -r '.guid')
+
+SUB_AGENT_ROUTE=$(curl -s -H "Authorization: Bearer $TOKEN" \
+  "$CF_API_URL/v3/agents/$SUB_AGENT_GUID" | jq -r '.links.route.href')
+```
+
+**Step 4: communicate with the sub-agent**
+```bash
+# Via GoRouter (external HTTP)
+curl -X POST "https://$SUB_AGENT_ROUTE/session" \
+  -H "Authorization: Basic $(echo -n "$SUB_AGENT_ID:$SUB_AGENT_PASSWORD" | base64)"
+  -d '{"title": "build the payment service"}'
+
+# Via C2C networking (internal, lower latency — same CF space)
+curl -X POST "http://sub-agent-x1y2z3.apps.internal:8080/session" ...
+```
+
+The new container has its own opencode server, its own sessions, its own working
+directory, its own UAA client (scoped to <= parent's permissions).
+
+### 9.4 When to Use Each Level
+
+| Use Level 1 (opencode task tool) | Use Level 2 (CF sub-agents) |
+|----------------------------------|-----------------------------|
 | Parallel sub-tasks within one job | Long-running separate workstreams |
-| Specialist personas (go-specialist, test-writer) | Agents that persist beyond parent's task |
-| Fast, lightweight parallel work | Isolated memory/disk environments |
-| Shared context / same codebase | Different codebases or spaces |
+| Specialist personas within same codebase | Agents that outlive the parent's session |
+| Fast, lightweight parallel work | Isolated disk / working directory per agent |
+| Shared CF credentials / same container | Different codebases or CF spaces |
+| **Available: Phase 1** | **Available: Phase 2** |
 
-### 9.3 Sub-Agent Constraints (Level 2)
+### 9.5 Sub-Agent Constraints (Level 2)
 
 - Sub-agent's UAA scope <= parent's UAA scope (no privilege escalation)
 - Sub-agent inherits same space grants as parent by default
-- Platform enforces: max depth = 3 (parent -> child -> grandchild)
-- Platform enforces: max 10 sub-agents per agent
+- Platform enforces: max depth = 3 (parent → child → grandchild)
+- Platform enforces: max 10 Level 2 sub-agents per agent
 
-### 9.4 Sub-Agent Communication (Level 2)
+### 9.6 Sub-Agent Communication — Level 2
 
-Via GoRouter (external):
+Via GoRouter (external, crosses network boundary):
 ```
-POST https://sub-agent-x1y2z3.apps.example.com/session/root123/prompt_async
-```
-
-Via C2C networking (internal, lower latency):
-```
-POST http://sub-agent-x1y2z3.apps.internal:8080/session/root123/prompt_async
+POST https://sub-agent-x1y2z3.apps.example.com/session/:id/prompt_async
+Authorization: Basic <base64(clientID:serverPassword)>
 ```
 
-C2C network policies between parent and child agents are auto-provisioned by `AgentCreateJob`.
+Via C2C networking (internal, same CF space, lower latency):
+```
+POST http://sub-agent-x1y2z3.apps.internal:8080/session/:id/prompt_async
+```
+
+C2C network policies between parent and child agents are auto-provisioned by
+`AgentCreateJob` when `parent_agent` relationship is present.
 
 ---
 
