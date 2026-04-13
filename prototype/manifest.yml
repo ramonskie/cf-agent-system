@@ -1,0 +1,50 @@
+---
+# CF Prototype Manifest — opencode serve as a CF app
+#
+# Usage:
+#   cf push -f manifest.yml
+#
+# Prerequisites:
+#   - CF target set: cf target -o myorg -s myspace
+#   - Docker image built and pushed: see push.sh
+#   - ANTHROPIC_API_KEY available (or other AI provider key)
+#
+# This validates the core CF agent assumptions:
+#   - opencode binds to 0.0.0.0:$PORT ✓
+#   - GET /global/health returns 200 ✓
+#   - opencode API accessible via CF route ✓
+#   - cf CLI available inside container ✓
+
+applications:
+  - name: opencode-agent-prototype
+    docker:
+      image: ghcr.io/YOUR_ORG/opencode-agent:latest  # replace with your built image
+    command: null                                        # uses Dockerfile ENTRYPOINT
+    memory: 512M
+    disk_quota: 2G
+    instances: 1
+    health-check-type: http
+    health-check-http-endpoint: /global/health
+    health-check-invocation-timeout: 30
+    readiness-health-check-type: http
+    readiness-health-check-http-endpoint: /global/health
+    env:
+      # Required: AI provider key (at least one)
+      ANTHROPIC_API_KEY: ((anthropic-api-key))    # use cf set-env or CredHub ref
+
+      # Secure the opencode HTTP API with Basic Auth
+      OPENCODE_SERVER_PASSWORD: ((opencode-password))
+
+      # CF credentials for the agent to manage CF resources
+      # In the real Agent system, CAPI injects these automatically
+      CF_API_URL: https://api.sys.example.com     # replace with your CF API endpoint
+      CF_CLIENT_ID: agent-prototype               # UAA client ID (create manually for test)
+      CF_CLIENT_SECRET: ((cf-client-secret))      # UAA client secret
+
+      # Point opencode's data dir to a known location
+      # Without a volume service, sessions are lost on restart (acceptable for Phase 1)
+      # XDG_DATA_HOME: /mnt/data                 # uncomment if using CF volume service
+
+    # Optional: mount a CF volume service for persistent session storage
+    # services:
+    #   - opencode-data-volume
