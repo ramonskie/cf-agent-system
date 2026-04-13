@@ -24,6 +24,7 @@
 14. [Diego Integration](#14-diego-integration)
 15. [BOSH Packaging](#15-bosh-packaging)
 16. [Implementation Phases](#16-implementation-phases)
+17. [Agent Runtime Catalog](#17-agent-runtime-catalog)
 
 ---
 
@@ -37,23 +38,27 @@ Cloud Foundry today manages two primary first-class resources:
 This document proposes a **third first-class resource**: the **Agent**. An agent is a
 long-running, autonomous AI process that:
 
-1. Is created with `cf create-agent opencode` (and eventually other agent types)
-2. Runs `opencode serve` inside a CF Diego container
+1. Is created with `cf create-agent <type>` (opencode, Claude Code, OpenHands, and others)
+2. Runs an agent runtime server inside a CF Diego container
 3. Is scoped to a CF space (same isolation model as apps)
 4. Holds a UAA client credential delegated by the platform
-5. Can spawn **sub-agents** — new opencode sessions — via the opencode Session API
+5. Can spawn **sub-agents** — child agent instances — via the runtime's session/task API
 6. Can push, update, and manage CF apps within its assigned space(s)
-7. Exposes the full **opencode HTTP/SSE API** on a registered CF route
+7. Exposes the runtime's HTTP/SSE API on a registered CF route
 
-The key insight: **opencode is already a server**. `opencode serve` exposes a full
-OpenAPI 3.1 HTTP server with sessions, messages, sub-agent spawning, file access, tools,
-and SSE event streaming. The CF Agent system's job is to:
+The key insight: **modern AI agent runtimes are already servers**. opencode, Claude Code,
+OpenHands and others all expose HTTP APIs with sessions, messages, sub-agent spawning,
+and event streaming. The CF Agent system's job is to:
 
-- Package that server as a first-class CF resource
+- Package any conforming agent runtime as a first-class CF resource
 - Provision it with delegated CF API credentials
 - Register its route through GoRouter
 - Manage its lifecycle (create/start/stop/delete)
 - Wire its parent→child session model to CF's space/org model
+
+**Phase 1** ships with `opencode` as the reference runtime. The `agent_type` field in the
+resource model and the `agent_types` catalog in CAPI are designed from the start to
+accommodate additional runtimes (Claude Code, OpenHands, Gastown, custom) in later phases.
 
 ---
 
@@ -128,13 +133,13 @@ CREATE TABLE agents (
   guid              UUID PRIMARY KEY,
   name              VARCHAR(255) NOT NULL,
   state             ENUM('CREATING','STARTING','RUNNING','STOPPING','STOPPED','ERROR'),
-  agent_type        VARCHAR(255) NOT NULL DEFAULT 'opencode',
+  agent_type        VARCHAR(255) NOT NULL DEFAULT 'opencode',  -- references agent_types.name
   space_guid        UUID NOT NULL REFERENCES spaces(guid),
   uaa_client_id     VARCHAR(255) NOT NULL,
   process_guid      VARCHAR(255),            -- Diego LRP process guid
   route_guid        UUID REFERENCES routes(guid),
   parent_guid       UUID REFERENCES agents(guid),  -- NULL for root agents
-  opencode_session_id VARCHAR(255),          -- active root session ID
+  runtime_session_id VARCHAR(255),           -- active root session ID (runtime-specific)
   working_dir       VARCHAR(1024),
   created_at        TIMESTAMP NOT NULL,
   updated_at        TIMESTAMP NOT NULL,
@@ -148,9 +153,25 @@ CREATE TABLE agent_space_grants (
   role        ENUM('readonly', 'deployer', 'full'),
   PRIMARY KEY (agent_guid, space_guid)
 );
+
+-- Catalog of supported agent runtimes (operator-managed)
+CREATE TABLE agent_types (
+  name              VARCHAR(255) PRIMARY KEY,  -- e.g. 'opencode', 'claude-code', 'openhands'
+  display_name      VARCHAR(255) NOT NULL,
+  docker_image      VARCHAR(1024) NOT NULL,
+  health_check_path VARCHAR(255) NOT NULL DEFAULT '/global/health',
+  session_api_path  VARCHAR(255) NOT NULL DEFAULT '/session',
+  min_memory_mb     INTEGER NOT NULL DEFAULT 512,
+  min_disk_mb       INTEGER NOT NULL DEFAULT 1024,
+  capabilities      TEXT[],                   -- e.g. ['spawn_sub_agents', 'push_apps']
+  required_env      TEXT[],                   -- e.g. ['ANTHROPIC_API_KEY']
+  enabled           BOOLEAN NOT NULL DEFAULT true,
+  created_at        TIMESTAMP NOT NULL,
+  updated_at        TIMESTAMP NOT NULL
+);
 ```
 
-Secrets (`CF_CLIENT_SECRET`, `OPENCODE_SERVER_PASSWORD`) are stored in CredHub at:
+Secrets (`CF_CLIENT_SECRET`, runtime server password) are stored in CredHub at:
 - `/cf/agents/<agent-guid>/client_secret`
 - `/cf/agents/<agent-guid>/server_password`
 
@@ -176,7 +197,7 @@ GET    /v3/agents/:guid/events                 Proxy -> opencode SSE /event
 POST   /v3/agents/:guid/space_grants           Grant access to additional space
 DELETE /v3/agents/:guid/space_grants/:space    Revoke space access
 
-GET    /v3/agent_types                         Catalog of available agent types
+GET    /v3/agent_types                         Catalog of operator-enabled agent runtimes
 ```
 
 ### 3.3 Agent Create Request
@@ -436,6 +457,61 @@ OPENCODE_SERVER_USERNAME=opencode       # default username
 The CF platform generates `OPENCODE_SERVER_PASSWORD` at agent creation, stores it in
 CredHub, and injects it into the container. The end user never sees it — CF CLI proxy
 endpoints retrieve it transparently.
+
+### 4.10 Config Layering and User Overrides
+
+Source-verified from `packages/opencode/src/config/config.ts` (`loadGlobal` function).
+
+opencode loads config via `mergeDeep` in this order:
+
+```
+config.json  →  opencode.json  →  opencode.jsonc
+```
+
+All files are loaded from `Global.Path.config`, which resolves to the XDG config
+directory: `$XDG_CONFIG_HOME/opencode/` (default: `~/.config/opencode/`).
+
+**The operator bakes a base `opencode.json` into the Docker image** with platform-level
+settings (e.g. the CF-specific system prompt, tool permissions, default model). The user
+can then **override or extend** that config by providing their own `opencode.json` or
+`opencode.jsonc` at the same path:
+
+| Layer | Who sets it | How |
+|-------|-------------|-----|
+| `config.json` (base) | Platform operator | Baked into Docker image at `/root/.config/opencode/config.json` |
+| `opencode.json` (override) | End user | Mounted via CF volume service at `$XDG_CONFIG_HOME/opencode/` |
+| `opencode.jsonc` (user extend) | End user | Injected via env + entrypoint, or volume service |
+
+**Volume service mount pattern** (Phase 2):
+```yaml
+# manifest.yml — mount a user-owned NFS or S3FS volume
+applications:
+- name: my-agent
+  services:
+  - name: my-config-volume
+    volume_mounts:
+    - container_path: /root/.config/opencode
+      mode: rw
+```
+
+**Env + entrypoint pattern** (Phase 1, no volume service required):
+```sh
+# entrypoint.sh — inject user opencode.json from env var before start
+if [ -n "$OPENCODE_USER_CONFIG" ]; then
+  echo "$OPENCODE_USER_CONFIG" > ~/.config/opencode/opencode.jsonc
+fi
+trap 'kill -TERM $PID; wait $PID' TERM INT
+opencode serve --hostname 0.0.0.0 --port "$PORT" &
+PID=$!
+wait $PID
+```
+
+The user sets `OPENCODE_USER_CONFIG` as a CF env var (`cf set-env`) containing their
+JSON config blob. The entrypoint writes it before `opencode serve` starts, so
+`mergeDeep` picks it up as the top-level override layer.
+
+**Custom tools** are loaded from `{tool,tools}/*.{js,ts}` glob in the config directory.
+Users can drop custom tools into the same mounted volume alongside their `opencode.jsonc`.
 
 ---
 
@@ -1314,11 +1390,248 @@ it can be extracted into a dedicated `cf-agent-controller` BOSH job. Out of scop
 
 ### Phase 4 — Agent Type Catalog
 
-- [ ] `agent_types` catalog in CC DB
-- [ ] `GET /v3/agent_types` endpoint
-- [ ] Agent type versioning and pinning
-- [ ] Buildpack-based agent packaging (alternative to Docker)
-- [ ] Custom agent types (not just opencode)
+- [ ] `agent_types` table in CC DB (already designed in §3.1 schema)
+- [ ] `GET /v3/agent_types` endpoint returning runtime catalog
+- [ ] Agent type versioning and pinning (`agent_type_version` field on agents)
+- [ ] BOSH ops file entries for additional runtimes:
+  - `claude-code` — Claude Code SDK headless container, hooks API
+  - `openhands` — OpenHands Docker sandbox, micro-agent support
+  - `gastown` — Gastown Mayor/Polecat multi-agent, multi-runtime config
+- [ ] Runtime adapter interface (`health_check_path`, `session_api_path` per type)
+- [ ] Buildpack-based agent packaging (alternative to Docker images)
+- [ ] Custom operator-defined agent types via CF API
+
+---
+
+## 17. Agent Runtime Catalog
+
+### 17.1 Conceptual Model: Brain / Hands / Session
+
+Before cataloguing specific runtimes, it helps to understand the model that underlies
+all of them. Anthropic's Managed Agents design (source: anthropic.com/engineering/managed-agents)
+articulates the cleanest decoupling:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Brain (Harness)                                             │
+│  - LLM inference loop                                        │
+│  - Tool dispatch                                             │
+│  - NOT inside the sandbox                                    │
+│  - Calls sandbox via: execute(name, input) → string          │
+└─────────────────────────┬────────────────────────────────────┘
+                          │ tool call / shell exec
+┌─────────────────────────▼────────────────────────────────────┐
+│  Hands (Sandbox / Container)                                 │
+│  - Code execution, file I/O, shell commands                  │
+│  - Stateless, cattle — if it dies, harness catches as error  │
+│  - provision({resources}) → new container                    │
+└──────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────┐
+│  Session (Durable Event Log)                                 │
+│  - Lives outside both harness and sandbox                    │
+│  - emitEvent(id, event) / getEvents() / wake(sessionId)      │
+│  - Survives harness and container restarts                   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**CF Agent System mapping**:
+
+| Managed Agents concept | CF Agent System mapping |
+|------------------------|------------------------|
+| Brain / Harness | opencode process (or Claude Code SDK, OpenHands) |
+| Hands / Sandbox | Diego Garden container |
+| Session / Event log | opencode SQLite DB (Phase 1) → CF volume service (Phase 2) |
+| `provision({resources})` | CAPI `AgentCreateJob` → Diego DesiredLRP |
+| `execute(name, input)` | opencode tools (bash, file, browser, MCP) |
+| `wake(sessionId)` | `POST /session/:id/prompt_async` |
+
+This model is **runtime-agnostic by design**: the Brain can be swapped (opencode,
+Claude Code, OpenHands) without changing the Hands (Diego container) or the Session
+persistence layer (CF volume service or external store).
+
+---
+
+### 17.2 opencode (Reference Runtime)
+
+**Source**: `sst/opencode` repository, `packages/opencode/src/`
+
+| Property | Value |
+|----------|-------|
+| Start command | `opencode serve --port $PORT --hostname 0.0.0.0` |
+| Health check | `GET /global/health` → `{ healthy: true }` |
+| Session API | `POST /session`, `POST /session/:id/prompt_async` |
+| Sub-agent mechanism | `task` tool — LLM calls it; spawns child session via `Session.create({ parentID })` |
+| Config | `opencode.json` / `opencode.jsonc` in `$XDG_CONFIG_HOME/opencode/` (layered merge) |
+| Event stream | `GET /event` — SSE, heartbeat every 10s |
+| Auth | `OPENCODE_SERVER_PASSWORD` HTTP Basic Auth |
+| Session store | SQLite at `$XDG_DATA_HOME/opencode/opencode.db` |
+| Custom tools | `{tool,tools}/*.{js,ts}` glob in config dir |
+| Phase 1 image | `oven/bun:1` + `npm install -g opencode-ai` + SIGTERM entrypoint |
+
+**Sub-agent model** (source-verified from `packages/opencode/src/tool/task.ts`):
+- LLM invokes the built-in `task` tool with `{ description, prompt, subagent_type?, task_id? }`
+- `subagent_type` must match a named agent in `opencode.json` with `mode: "subagent"`
+- `task_id` resumes an existing child session rather than creating a new one
+- Child session created with `parentID: ctx.sessionID` automatically
+- Agents with `mode: "primary"` are excluded from `task` tool dispatch
+
+**Config layering** (see §4.10 for full details):
+```
+config.json → opencode.json → opencode.jsonc
+             (operator)       (user override)
+```
+
+**CF readiness**: High. All server behaviour is source-verified. Phase 1 ships this runtime.
+
+---
+
+### 17.3 Claude Code (Anthropic)
+
+**Source**: `docs.anthropic.com/en/docs/claude-code/sdk` + Managed Agents blog post
+
+| Property | Value |
+|----------|-------|
+| Deployment mode | Headless / programmatic (`--no-interaction` flag) |
+| Session API | Claude Code SDK: `ClaudeCodeSession`, streaming responses |
+| Sub-agent mechanism | SDK `SubAgent` class; can spawn child sessions with scoped tools |
+| Config | `settings/config.json` (similar layering to opencode) |
+| Event stream | SDK `on('event', handler)` — hooks for `sessionStart`, `preToolUse`, `postToolUse` |
+| Auth | Anthropic API key (`ANTHROPIC_API_KEY`) |
+| Session store | SDK-managed; external store configurable |
+| Custom tools | MCP tool server integration; tool permissions via `settings/config.json` |
+| Runtime model | Harness runs in-process with Node.js SDK |
+
+**CF container approach**:
+- Image: `node:20` + `npm install -g @anthropic-ai/claude-code`
+- Entrypoint: SDK wrapper process exposing an HTTP shim matching the opencode session API
+  (so CAPI's `AgentCreateJob` and proxy endpoints don't need per-runtime branches)
+- Health check: HTTP shim endpoint (`GET /health`)
+
+**Key difference from opencode**: Claude Code SDK is a library, not a standalone server.
+A thin HTTP shim (50–100 lines of Node.js) is needed to expose the Claude Code SDK as
+an HTTP/SSE server compatible with the CF agent API contract.
+
+**Anthropic Managed Agents alignment**:
+- Claude Code is one of the reference harnesses in Anthropic's Managed Agents model
+- The CF platform acts as the `provision()` + session persistence layer
+- Claude Code's `execute(name, input)` pattern maps to Diego Garden container shell calls
+
+**CF readiness**: Medium. SDK is mature; HTTP shim is required. Phase 4 candidate.
+
+---
+
+### 17.4 OpenHands
+
+**Source**: `openhands.dev`, GitHub `All-Hands-AI/OpenHands` (65k stars)
+
+| Property | Value |
+|----------|-------|
+| Start command | `python -m openhands.server --port $PORT` (Docker/K8s) |
+| Health check | `GET /health` |
+| Session API | REST API: `POST /conversations`, `POST /conversations/:id/events` |
+| Sub-agent mechanism | Micro-agent SDK: `@micro_agent` decorator, custom agent classes |
+| Config | `config.toml` / environment variables |
+| Event stream | WebSocket (`/ws`) + REST polling |
+| Auth | API key (`OPENHANDS_API_KEY`) |
+| Session store | Configurable — SQLite (dev) or PostgreSQL (prod) |
+| Custom tools | MCP tool support; custom micro-agents via Python SDK |
+| Runtime model | Python asyncio server; sandbox runtime via Docker-in-Docker or K8s sidecar |
+
+**CF container approach**:
+- Image: `all-hands-ai/runtime:latest` (official Docker image)
+- Requires sandbox isolation — OpenHands spawns a sub-container for code execution
+  - CF with Docker-in-Docker: needs privileged container (Diego `allow_container_overlay`)
+  - Alternative: use OpenHands with an SSH sandbox pointing to a second CF app
+- Health check: `GET /health`
+- Session persistence: `POSTGRES_*` env vars pointing to a CF-bound PostgreSQL service instance
+
+**Key consideration**: OpenHands's sandbox model (code execution in sub-container) requires
+either Docker-in-Docker (privileged) or an external compute target. In CF, the cleanest
+approach is SSH mode pointing to a separate CF app as the execution sandbox.
+
+**CF readiness**: Medium. Server API is clean; sandbox model needs architectural work. Phase 4 candidate.
+
+---
+
+### 17.5 Gastown
+
+**Source**: `github.com/gastownhall/gastown` (13.9k stars, 1.3k forks)
+
+| Property | Value |
+|----------|-------|
+| Concept | Multi-agent workspace manager (orchestration layer, not an inference engine) |
+| Roles | Mayor (orchestrator), Polecat (worker), Witness (health monitor), Deacon (cross-rig supervisor) |
+| Runtime | Runtime-agnostic: `settings/config.json` `runtime.provider` → `claude-code`, `codex`, `copilot`, `opencode` |
+| Persistence | Beads ledger — git-worktree-backed persistent work state (survives restarts) |
+| Coordination | Mailboxes + identities + handoffs for agent-to-agent messaging |
+| Start command | `gastown mayor --port $PORT` (or per-role commands) |
+| Health check | `GET /status` |
+| Config | `settings/config.json` (includes `runtime.provider`) |
+
+**CF mapping**:
+
+```
+Gastown Mayor    ←→  CF parent agent   (root LRP, owns the session)
+Gastown Polecat  ←→  CF sub-agent      (child LRP, scoped task worker)
+Beads ledger     ←→  CF volume service (git-worktree-backed persistence)
+Mailboxes        ←→  C2C networking    (Policat-to-Polecat direct HTTP)
+```
+
+**Multi-agent pattern with CF**:
+1. User creates a Gastown Mayor agent (`cf create-agent gastown my-mayor`)
+2. Mayor receives a task via `cf agent-command`
+3. Mayor spawns Polecats via `AgentCreateJob` (each Polecat = a CF sub-agent with `parent_guid`)
+4. Polecats communicate via C2C routes (pre-provisioned by CAPI per §10)
+5. Witness monitors all Polecats; Deacon watches cross-Mayor consistency
+6. Beads ledger persisted via CF volume service
+
+**Key difference from opencode**: Gastown is a coordination layer that wraps other runtimes.
+Deploying Gastown to CF effectively gives operators an orchestration tier that can spawn
+sub-agents of *any* supported runtime type (opencode, Claude Code, etc.).
+
+**CF readiness**: Medium-high. Gastown has native opencode config in its own repo. The
+Mayor/Polecat model maps cleanly to the CF parent/child agent hierarchy. Phase 4 candidate.
+
+---
+
+### 17.6 Runtime Comparison Matrix
+
+| Property | opencode | Claude Code | OpenHands | Gastown |
+|----------|----------|-------------|-----------|---------|
+| Type | Inference server | SDK (needs shim) | Inference server | Orchestration layer |
+| Language | TypeScript (Bun) | TypeScript (Node) | Python | Go (assumed) |
+| HTTP API | Full OpenAPI 3.1 | Via shim | REST + WS | REST |
+| Session API | `/session` | SDK → shim | `/conversations` | `/sessions` |
+| Sub-agents | `task` tool (LLM-driven) | SDK SubAgent | micro-agents | Mayor/Polecat |
+| Persistence | SQLite | SDK-managed | SQLite / PG | Git worktrees (Beads) |
+| Sandbox | In-process (tools) | In-process | Sub-container (Docker) | Delegates to runtime |
+| CF image | Custom (bun + entrypoint) | Custom (node + shim) | Official Docker | Custom |
+| Config override | `opencode.json` layer | `settings/config.json` | `config.toml` / env | `settings/config.json` |
+| Auth | HTTP Basic | API key | API key | API key |
+| CF Phase | **Phase 1** | Phase 4 | Phase 4 | Phase 4 |
+
+---
+
+### 17.7 Runtime Adapter Interface
+
+For CAPI to support multiple runtimes, each `agent_type` record in the `agent_types`
+table specifies the adapter contract:
+
+```sql
+-- From §3.1 agent_types table:
+health_check_path  VARCHAR(255)  -- e.g. '/global/health', '/health', '/status'
+session_api_path   VARCHAR(255)  -- e.g. '/session', '/conversations', '/sessions'
+```
+
+`AgentCreateJob` uses `agent_type.health_check_path` for the Diego LRP health check.
+The CAPI proxy endpoints (`GET /v3/agents/:guid/sessions`, `POST /v3/agents/:guid/message`)
+use `agent_type.session_api_path` to know which upstream path to proxy to.
+
+For runtimes with non-standard event streaming (OpenHands WebSocket vs opencode SSE), a
+**runtime shim** container is the recommended approach: keep the internal runtime API as-is
+but expose a normalized HTTP/SSE interface at the CF boundary. This keeps CAPI's proxy
+logic simple and runtime-independent.
 
 ---
 
